@@ -29,10 +29,14 @@ BLOB_MAX = 300_000_000           # bigger clips are not copied
 SMALL_SKIP = {"words.json", "words_en.json"}     # big transcripts, only needed to re-make a clip
 BLOB_EXT = {".mp4", ".jpg", ".jpeg", ".png", ".webp"}
 EVERY = 30                       # seconds between scans
-MASS_DELETE = 0.5                # never delete more than this share of what is tracked in one scan
+MASS_DELETE = 0.25               # never delete more than this share of what is tracked in one scan
 HEARTBEAT = "__heartbeat__:cloudshell"   # touched while PeakCut runs on Cloud Shell: Render stays out of the way
 BUSY = "__busy__:render"                 # touched while Render is in the middle of a post
 GRACE = 180                              # seconds of silence before Render takes over posting
+MISSING_FOR = 600                        # a file must stay missing this long before its copy is deleted
+DB_NAME = "peakcut.db"                   # the sign-in database: copied as a consistent snapshot
+DB_EVERY = 120                           # seconds between snapshots while it keeps changing
+SNAP = Path(os.environ.get("PCSYNC_SNAP") or HOME / ".pcsync-db.snapshot")
 
 
 def log(*a):
@@ -312,6 +316,58 @@ def open_blobs(s):
     return B2(s["B2_KEY_ID"], s["B2_APP_KEY"], s["B2_BUCKET"])
 
 
+# ------------------------------------------------------------------ the sign-in database
+def db_signature(data: Path):
+    sig = []
+    for n in (DB_NAME, DB_NAME + "-wal"):
+        try:
+            st = (data / n).stat()
+            sig.append([st.st_mtime_ns, st.st_size])
+        except OSError:
+            sig.append(None)
+    return sig
+
+
+def snapshot_db(data: Path):
+    """A consistent copy of the live database (safe while PeakCut is using it)."""
+    src = data / DB_NAME
+    if not src.is_file():
+        return None
+    tmp = SNAP.with_suffix(".new")
+    tmp.unlink(missing_ok=True)
+    a = sqlite3.connect(str(src), timeout=30)
+    b = sqlite3.connect(str(tmp))
+    try:
+        a.backup(b)
+    finally:
+        b.close()
+        a.close()
+    tmp.replace(SNAP)
+    return SNAP
+
+
+def db_fingerprint(p: Path) -> str:
+    """A hash of what is IN the database, not of its bytes (closing PeakCut changes the bytes without changing the data)."""
+    h = hashlib.sha1()
+    con = sqlite3.connect(str(p), timeout=30)
+    try:
+        for line in con.iterdump():
+            h.update(line.encode("utf-8", "replace"))
+    finally:
+        con.close()
+    return h.hexdigest()
+
+
+def restore_db(blobs, data: Path) -> Path:
+    """Put the copied database in place. Only while PeakCut is not running."""
+    tmp = data / (DB_NAME + ".incoming")
+    blobs.get("data/" + DB_NAME, tmp)
+    for n in ("-wal", "-shm"):
+        (data / (DB_NAME + n)).unlink(missing_ok=True)
+    tmp.replace(data / DB_NAME)
+    return data / DB_NAME
+
+
 # ------------------------------------------------------------------ one pass
 def load_state() -> dict:
     try:
@@ -326,7 +382,7 @@ def save_state(st):
     tmp.replace(STATE)
 
 
-def sync_once(meta: Meta, blobs, writer: str, data: Path = None) -> dict:
+def sync_once(meta: Meta, blobs, writer: str, data: Path = None, force_db=False) -> dict:
     data = data or DATA
     st = load_state()
     tracked = st["files"]
@@ -370,13 +426,20 @@ def sync_once(meta: Meta, blobs, writer: str, data: Path = None) -> dict:
         except Exception as e:  # noqa: BLE001
             res["errors"].append(f"{rel}: {e}")
 
-    gone = [rel for rel in tracked if rel not in now]
+    for rel in now:
+        if rel in tracked:
+            tracked[rel].pop("missing", None)          # it is back
+    gone = [rel for rel in tracked if rel not in now and rel != DB_NAME]
     if gone and data.is_dir():
         if len(gone) > max(3, MASS_DELETE * len(tracked)):
             res["errors"].append(f"{len(gone)} of {len(tracked)} tracked files are missing here: "
                                  f"nothing was deleted. If you wiped PeakCut on purpose, run: pcsync forget")
         else:
+            t_now = time.time()
             for rel in gone:
+                first = tracked[rel].setdefault("missing", t_now)
+                if t_now - first < MISSING_FOR:
+                    continue                           # missing only for a moment: wait before deleting its copy
                 try:
                     if tracked[rel].get("kind") == "blob":
                         blobs.delete("data/" + rel)
@@ -385,6 +448,36 @@ def sync_once(meta: Meta, blobs, writer: str, data: Path = None) -> dict:
                     res["deleted"] += 1
                 except Exception as e:  # noqa: BLE001
                     res["errors"].append(f"delete {rel}: {e}")
+
+    if (data / DB_NAME).is_file():
+        sig = db_signature(data)
+        old = tracked.get(DB_NAME)
+        t_now = time.time()
+        due = force_db and (not old or old.get("sig") != sig) or not old or (old.get("sig") != sig and t_now - old.get("at", 0) >= DB_EVERY)
+        if due:
+            try:
+                snap = snapshot_db(data)
+                sha = sha1_of(snap)
+                if old and old.get("sha1") == sha:
+                    old.update(sig=sig, at=t_now)
+                    res["skipped"] += 1
+                else:
+                    blobs.put("data/" + DB_NAME, snap)
+                    base = old["version"] if old else 0
+                    ok = meta.put(DB_NAME, "blob", None, snap.stat().st_size, sha, writer, base)
+                    if not ok:
+                        r = meta.row(DB_NAME)
+                        if r and r[1] == writer:
+                            base = r[0]
+                            ok = meta.put(DB_NAME, "blob", None, snap.stat().st_size, sha, writer, base)
+                    if ok:
+                        tracked[DB_NAME] = {"mtime": 0, "size": 0, "sha1": sha, "version": base + 1, "kind": "blob", "sig": sig, "at": t_now,
+                                            "fp": db_fingerprint(snap)}
+                        res["pushed"] += 1
+                    else:
+                        res["conflicts"].append(DB_NAME)
+            except Exception as e:  # noqa: BLE001
+                res["errors"].append(f"{DB_NAME}: {e}")
 
     st["last"] = time.time()
     save_state(st)
