@@ -4,7 +4,7 @@
 Small files (settings, jobs, the post queue, connected accounts) go to a Postgres table on Aiven.
 Clips and avatars go to a Backblaze B2 bucket.
 
-Commands:  selftest | once | loop | pull | status | forget | wipe-remote
+Commands:  selftest | once | loop | release | pull | status | forget | wipe-remote
 Settings are read from ~/.pc-secrets (B2_KEY_ID, B2_APP_KEY, B2_BUCKET, PG_URI, optional SERVER_NAME).
 """
 import base64
@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -32,7 +33,7 @@ EVERY = 30                       # seconds between scans
 MASS_DELETE = 0.25               # never delete more than this share of what is tracked in one scan
 HEARTBEAT = "__heartbeat__:cloudshell"   # touched while PeakCut runs on Cloud Shell: Render stays out of the way
 BUSY = "__busy__:render"                 # touched while Render is in the middle of a post
-GRACE = 180                              # seconds of silence before Render takes over posting
+GRACE = 75                               # seconds of silence before Render takes over (a planned stop tells it at once)
 MISSING_FOR = 600                        # a file must stay missing this long before its copy is deleted
 DB_NAME = "peakcut.db"                   # the sign-in database: copied as a consistent snapshot
 DB_EVERY = 120                           # seconds between snapshots while it keeps changing
@@ -538,6 +539,28 @@ def run_once(s):
         meta.close()
 
 
+def heartbeat_loop(s, every=15):
+    """Says 'Cloud Shell is here' every few seconds, on its own, so a long sync never makes Render think Cloud Shell is gone."""
+    while True:
+        try:
+            if peakcut_alive():
+                meta = Meta(s["PG_URI"])
+                try:
+                    meta.touch(HEARTBEAT, s["SERVER_NAME"])
+                finally:
+                    meta.close()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(every)
+
+
+def release(meta, blobs, writer, data=None):
+    """A planned stop: save everything one last time, then tell Render at once that it can take over."""
+    res = sync_once(meta, blobs, writer, data, force_db=True)
+    meta.clear(HEARTBEAT)
+    return res
+
+
 def report(res):
     if not (res["pushed"] or res["deleted"] or res["conflicts"] or res["errors"]):
         return
@@ -705,8 +728,18 @@ def main(argv):
         return cmd_selftest(s)
     if cmd == "once":
         report(run_once(s)); return 0
+    if cmd == "release":
+        meta = Meta(s["PG_URI"])
+        try:
+            res = release(meta, open_blobs(s), s["SERVER_NAME"])
+        finally:
+            meta.close()
+        report(res)
+        log("everything is saved and Render has been told it can take over")
+        return 0
     if cmd == "loop":
         log("sync started, every", EVERY, "seconds")
+        threading.Thread(target=heartbeat_loop, args=(s,), daemon=True).start()
         while True:
             try:
                 report(run_once(s))
