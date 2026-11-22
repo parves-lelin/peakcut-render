@@ -2,10 +2,14 @@
 """Applies the small changes PeakCut needs to run on Render as the 'light' server.
 
 Run:  python patch_peakcut.py PATH_TO_PEAKCUT
-Each change is looked up by its exact text. If the developer changed that text, nothing is half-applied: it stops and says which one.
+Each change is looked up by its exact text. The two essential changes (light mode, the Render address) stop the build if PeakCut
+changed that text; nothing is half-applied. The other changes only add friendlier messages, so if PeakCut changed those lines they are
+skipped with a warning.
 """
 import os
 import sys
+
+ESSENTIAL = {"light mode: show everything, process nothing", "accept the Render address"}
 
 PATCHES = [
     ("studio/server.py", "light mode: show everything, process nothing",
@@ -54,8 +58,12 @@ def main(root):
             todo[path] = text
             continue
         if text.count(old) != 1:
-            print(f"STOP: cannot apply '{what}' in {rel} ({text.count(old)} matches). PeakCut changed here; nothing was written.")
-            return 1
+            if what in ESSENTIAL:
+                print(f"STOP: cannot apply '{what}' in {rel} ({text.count(old)} matches). PeakCut changed here; nothing was written.")
+                return 1
+            print(f"skipped (optional): '{what}' in {rel}, PeakCut changed those lines")
+            todo[path] = text
+            continue
         todo[path] = text.replace(old, new)
         print("ok:", what)
     for path, text in todo.items():
